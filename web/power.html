@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>功率与配额</title>
+  <style>
+    body { font-family: "Segoe UI", sans-serif; margin: 24px; color: #1c2430; }
+    table { border-collapse: collapse; width: 100%; margin-bottom: 16px; }
+    th, td { border: 1px solid #d6dde6; padding: 6px 10px; text-align: left; }
+    th { background: #eef3f9; }
+    pre { background: #f7f9fc; padding: 10px; overflow-x: auto; }
+  </style>
+</head>
+<body>
+  <h1>功率与配额</h1>
+  <h2>并网点</h2>
+  <table><tbody id="grid"></tbody></table>
+  <h2>配额与结算</h2>
+  <table><tbody id="quota"></tbody></table>
+  <h2>趋势</h2>
+  <pre id="trend"></pre>
+  <script>
+    async function load() {
+      const grid = await (await fetch("/api/grid")).json();
+      const flow = grid.flow;
+      document.getElementById("grid").innerHTML = [
+        ["上网限额(kW)", grid.limit.export_limit_kw],
+        ["用电限额(kW)", grid.limit.import_limit_kw],
+        ["累计上网(kWh)", flow.export_kwh],
+        ["累计用电(kWh)", flow.import_kwh],
+        ["并网校验", grid.checks],
+        ["频率", grid.frequency.last ? grid.frequency.last.frequency_hz : "无"],
+      ].map(([key, value]) => `<tr><th>${key}</th><td>${value}</td></tr>`).join("");
+
+      const quota = await (await fetch("/api/quota")).json();
+      document.getElementById("quota").innerHTML = [
+        ["周期", quota.period],
+        ["滚动次数", quota.rolls],
+        ["已充电量(kWh)", quota.totals.charge_kwh],
+        ["已放电量(kWh)", quota.totals.discharge_kwh],
+        ["剩余充电(kWh)", quota.remaining.charge_kwh],
+        ["剩余放电(kWh)", quota.remaining.discharge_kwh],
+        ["本周期收益", quota.settlement.margin],
+      ].map(([key, value]) => `<tr><th>${key}</th><td>${value}</td></tr>`).join("");
+
+      const trend = await (await fetch("/api/trend?signal=rk-01.voltage")).json();
+      document.getElementById("trend").textContent =
+        `信号 ${trend.signal}｜周期 ${trend.period_s}s｜均值 ${trend.mean}\n` +
+        trend.samples.map((point) => `${point.ts}  ${point.value}`).join("\n");
+    }
+    load();
+    setInterval(load, 5000);
+  </script>
+</body>
+</html>

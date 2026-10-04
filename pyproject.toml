@@ -1,0 +1,30 @@
+[project]
+name = "batterystore-cluster-control"
+version = "1.0.0"
+description = "cluster coordination kernel"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.setuptools]
+packages = [
+    "batterystore",
+    "batterystore.ns",
+    "batterystore.store",
+    "batterystore.audit",
+    "batterystore.rack",
+    "batterystore.bms",
+    "batterystore.pcs",
+    "batterystore.temp",
+    "batterystore.fire",
+    "batterystore.grid",
+    "batterystore.soc",
+    "batterystore.balance",
+    "batterystore.quota",
+    "batterystore.ops",
+    "batterystore.console",
+]

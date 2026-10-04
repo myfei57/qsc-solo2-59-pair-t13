@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>PCS 与 BMS</title>
+  <style>
+    body { font-family: "Segoe UI", sans-serif; margin: 24px; color: #1c2430; }
+    section { margin-bottom: 20px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #d6dde6; padding: 6px 10px; text-align: left; }
+    th { background: #eef3f9; }
+    pre { background: #f7f9fc; padding: 10px; overflow-x: auto; }
+  </style>
+</head>
+<body>
+  <h1>PCS 与 BMS</h1>
+  <section>
+    <h2>PCS</h2>
+    <table>
+      <tbody id="pcs"></tbody>
+    </table>
+    <h3>供电输入</h3>
+    <button id="tie">并网</button>
+    <button id="off">离网</button>
+    <button id="reset">复位跳闸</button>
+  </section>
+  <section>
+    <h2>BMS</h2>
+    <pre id="bms"></pre>
+  </section>
+  <script>
+    async function post(path, body) {
+      const response = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body || {})});
+      return response.json();
+    }
+    async function load() {
+      const pcs = await (await fetch("/api/pcs")).json();
+      const rows = [
+        ["运行模式", pcs.state], ["迁移代际", pcs.generation], ["降额系数", pcs.derate_ratio],
+        ["输出(kW)", pcs.output_kw], ["上网(kW)", pcs.delivered_kw], ["无功(kVar)", pcs.reactive_kvar],
+        ["效率", pcs.efficient_at], ["爬坡(kW)", pcs.ramp_kw], ["跳闸", pcs.tripped],
+      ];
+      document.getElementById("pcs").innerHTML = rows
+        .map(([key, value]) => `<tr><th>${key}</th><td>${value}</td></tr>`).join("");
+      const bms = await (await fetch("/api/bms")).json();
+      document.getElementById("bms").textContent = JSON.stringify(bms, null, 2);
+    }
+    document.getElementById("tie").onclick = async () => { await post("/api/transfer", {power_kw: 120}); load(); };
+    document.getElementById("off").onclick = async () => { await post("/api/off-grid"); load(); };
+    document.getElementById("reset").onclick = async () => { await post("/api/fire/release"); load(); };
+    load();
+    setInterval(load, 5000);
+  </script>
+</body>
+</html>

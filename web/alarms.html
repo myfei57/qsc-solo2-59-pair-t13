@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>告警与审计</title>
+  <style>
+    body { font-family: "Segoe UI", sans-serif; margin: 24px; color: #1c2430; }
+    table { border-collapse: collapse; width: 100%; margin-bottom: 16px; }
+    th, td { border: 1px solid #d6dde6; padding: 6px 10px; text-align: left; }
+    th { background: #eef3f9; }
+    .alarm { color: #b91c1c; font-weight: 600; }
+    .warning { color: #b45309; }
+  </style>
+</head>
+<body>
+  <h1>告警与审计</h1>
+  <h2>簇告警（按最新编号路由）</h2>
+  <table>
+    <thead><tr><th>编号</th><th>分区</th><th>类型</th><th>级别</th><th>明细</th></tr></thead>
+    <tbody id="alerts"></tbody>
+  </table>
+  <h2>最近审计</h2>
+  <table>
+    <thead><tr><th>时间</th><th>组件</th><th>动作</th><th>级别</th><th>操作</th></tr></thead>
+    <tbody id="audit"></tbody>
+  </table>
+  <script>
+    async function load() {
+      const alerts = await (await fetch("/api/alerts")).json();
+      document.getElementById("alerts").innerHTML = alerts.alerts.length
+        ? alerts.alerts.map((item) =>
+            `<tr><td>${item.label}</td><td>${item.zone}</td><td>${item.code}</td>` +
+            `<td class="${item.severity}">${item.severity}</td>` +
+            `<td>${JSON.stringify(item.detail)}</td></tr>`).join("")
+        : `<tr><td colspan="5">当前无告警</td></tr>`;
+      const audit = await (await fetch("/api/audit?limit=30")).json();
+      document.getElementById("audit").innerHTML = audit.entries
+        .map((entry) =>
+          `<tr><td>${entry.ts}</td><td>${entry.component}</td><td>${entry.action}</td>` +
+          `<td class="${entry.severity}">${entry.severity}</td><td>${entry.payload.op_id || ""}</td></tr>`).join("");
+    }
+    load();
+    setInterval(load, 5000);
+  </script>
+</body>
+</html>

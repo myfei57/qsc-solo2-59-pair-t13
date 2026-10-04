@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>电池簇状态</title>
+  <style>
+    body { font-family: "Segoe UI", sans-serif; margin: 24px; color: #1c2430; }
+    table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+    th, td { border: 1px solid #d6dde6; padding: 6px 10px; text-align: left; }
+    th { background: #eef3f9; }
+    .warn { color: #b45309; }
+    .alarm { color: #b91c1c; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>电池簇状态</h1>
+  <p id="summary">读取中…</p>
+  <table>
+    <thead>
+      <tr><th>簇</th><th>分区</th><th>SOC</th><th>电压(V)</th><th>压差(mV)</th><th>最高温(℃)</th><th>额定值代际</th></tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <script>
+    async function load() {
+      const response = await fetch("/api/racks");
+      const payload = await response.json();
+      const rows = document.getElementById("rows");
+      rows.innerHTML = "";
+      for (const rack of payload.racks) {
+        const metrics = rack.metrics;
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td>${rack.rack_id}</td><td>${rack.zone}</td><td>${rack.soc_pct}</td>` +
+          `<td>${metrics.voltage_v}</td><td>${metrics.delta_mv}</td>` +
+          `<td>${metrics.max_temperature_c}</td><td>${rack.rating_epoch}</td>`;
+        rows.appendChild(tr);
+      }
+      const status = await (await fetch("/api/status")).json();
+      document.getElementById("summary").textContent =
+        `站点 ${status.station}｜运行 ${status.running}｜周期 ${status.cycles}｜操作 ${status.operations}`;
+    }
+    load();
+    setInterval(load, 5000);
+  </script>
+</body>
+</html>
