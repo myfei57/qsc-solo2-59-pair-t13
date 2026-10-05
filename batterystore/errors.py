@@ -10,21 +10,25 @@ from __future__ import annotations
 
 
 class StoreError(Exception):
-    """所有平台异常的基类，携带出错的组件名。"""
+    """所有平台异常的基类，携带出错的组件名与结构化细节。"""
 
-    def __init__(self, message: str, *, component: str = "batterystore") -> None:
+    def __init__(self, message: str, *, component: str = "batterystore", detail: dict | None = None) -> None:
         super().__init__(message)
         self.message = message
         self.component = component
+        self.detail = dict(detail or {})
 
     def as_record(self) -> dict:
         """转成审计可以直接落盘的一条记录。"""
 
-        return {
+        record = {
             "type": type(self).__name__,
             "component": self.component,
             "message": self.message,
         }
+        if self.detail:
+            record["detail"] = dict(self.detail)
+        return record
 
 
 class InterlockError(StoreError):

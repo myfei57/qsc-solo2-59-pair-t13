@@ -5,6 +5,6 @@ from __future__ import annotations
 from .charge import charge_rack
 from .discharge import discharge_rack
 from .suppression import suppress
-from .transfer import transfer_to_grid
+from .transfer import transfer_to_grid, transfer_to_offgrid
 
-__all__ = ["charge_rack", "discharge_rack", "suppress", "transfer_to_grid"]
+__all__ = ["charge_rack", "discharge_rack", "suppress", "transfer_to_grid", "transfer_to_offgrid"]

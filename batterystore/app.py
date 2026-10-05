@@ -27,7 +27,7 @@ from .ns.topology import Topology, build_default_topology
 from .ops.charge import charge_rack
 from .ops.discharge import discharge_rack
 from .ops.suppression import suppress
-from .ops.transfer import transfer_to_grid
+from .ops.transfer import transfer_to_grid, transfer_to_offgrid
 from .pcs.pcs import Pcs
 from .rack.cells import Cell
 from .rack.mapping import RackMapping
@@ -287,7 +287,7 @@ class Platform:
             return previous
 
     def transfer_grid_tie(self, power_kw: float = 120.0, frequency_hz: float = 50.0, dt: float = 1.0) -> dict:
-        """并网编排：BMS 就绪 → PCS 切换 → 并网校验 → 功率输出。"""
+        """并网编排：BMS 就绪 → 离网建压 → 同期校验 → 原子并网 → 功率输出。"""
 
         with self._lock:
             op_id = self.ids.next()
@@ -302,23 +302,19 @@ class Platform:
                 power_kw=power_kw,
                 dt=dt,
                 now=self.clock.now(),
+                actor=op_id,
             )
             summary = self._record_operation(op_id, "grid_tie", report)
             return {**report, **summary}
 
     def transfer_off_grid(self) -> dict:
-        """离网编排：先回到离网态，再清零功率。"""
+        """离网编排：与并网共用同一条切换临界区，被拒时说明是被抢先还是条件不满足。"""
 
         with self._lock:
             op_id = self.ids.next()
-            steps: list[dict] = []
-            violations: list[str] = []
-            if self.pcs.state_machine.state == "tripped":
-                violations.append("pcs_tripped")
-            else:
-                steps.append({"component": "pcs", "action": "transfer", "detail": self.pcs.transfer("off_grid", "off_grid_request")})
-            summary = self._record_operation(op_id, "off_grid", {"ok": not violations, "steps": steps, "violations": violations})
-            return {"station": self.station, "ok": not violations, "steps": steps, "violations": violations, **summary}
+            report = transfer_to_offgrid(self.pcs, self.station, actor=op_id)
+            summary = self._record_operation(op_id, "off_grid", report)
+            return {**report, **summary}
 
     def discharge(self, power_kw: float = 200.0, dt: float = 60.0) -> dict:
         """放电编排：并网限额钳位 → 爬坡 → 电量累计 → 配额记账。"""
@@ -588,23 +584,30 @@ class Platform:
             }
 
     def concurrency_probe(self, rounds: int = 32) -> dict:
-        """并发探测：多个线程同时切 PCS，核对状态迁移是否原子落定。"""
+        """并发探测：多个线程同时切 PCS，核对状态迁移是否原子落定、拒绝是否分类。"""
 
         observed: list[str] = []
         lock = threading.Lock()
         errors: list[str] = []
+        inconsistent = 0
 
         def worker(target: str) -> None:
+            nonlocal inconsistent
             for _ in range(rounds):
                 try:
-                    self.pcs.transfer(target, "concurrency_probe")
+                    self.pcs.transfer(target, "concurrency_probe", actor=f"probe-{target}")
                 except StoreError as error:
-                    errors.append(f"{target}:{type(error).__name__}")
+                    kind = error.detail.get("rejected", "condition")
+                    with lock:
+                        errors.append(f"{target}:{kind}")
                 with lock:
                     observed.append(self.pcs.state_machine.state)
+                if not self.pcs.is_consistent():
+                    with lock:
+                        inconsistent += 1
 
         if self.pcs.state_machine.state == "stopped":
-            self.pcs.transfer("off_grid", "probe_setup")
+            self.pcs.transfer("off_grid", "probe_setup", actor="probe-setup")
         threads = [
             threading.Thread(target=worker, args=("grid_tie",), name="probe-tie"),
             threading.Thread(target=worker, args=("off_grid",), name="probe-off"),
@@ -614,13 +617,17 @@ class Platform:
         for thread in threads:
             thread.join(timeout=30)
         illegal = sorted({state for state in observed if state not in ("grid_tie", "off_grid")})
+        preempted = sum(1 for entry in errors if entry.endswith(":preempted"))
         return {
             "rounds": rounds,
             "samples": len(observed),
             "states": sorted({state for state in observed}),
             "illegal_states": illegal,
             "rejections": len(errors),
-            "ok": not illegal,
+            "preempted": preempted,
+            "condition_rejections": len(errors) - preempted,
+            "inconsistent": inconsistent,
+            "ok": not illegal and not inconsistent,
         }
 
     def concurrency_fault_probe(self, rounds: int = 16) -> dict:
