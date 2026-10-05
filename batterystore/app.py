@@ -27,7 +27,7 @@ from .ns.topology import Topology, build_default_topology
 from .ops.charge import charge_rack
 from .ops.discharge import discharge_rack
 from .ops.suppression import suppress
-from .ops.transfer import transfer_to_grid
+from .ops.transfer import transfer_off_grid, transfer_to_grid
 from .pcs.pcs import Pcs
 from .rack.cells import Cell
 from .rack.mapping import RackMapping
@@ -287,10 +287,11 @@ class Platform:
             return previous
 
     def transfer_grid_tie(self, power_kw: float = 120.0, frequency_hz: float = 50.0, dt: float = 1.0) -> dict:
-        """并网编排：BMS 就绪 → PCS 切换 → 并网校验 → 功率输出。"""
+        """并网编排：仲裁 → BMS 就绪 → 离网建压 → 同期校验 → 合闸 → 功率输出。"""
 
         with self._lock:
             op_id = self.ids.next()
+            token = f"grid_tie:{op_id}"
             rack = self._rack(DEFAULT_RACK)
             report = transfer_to_grid(
                 self.pcs,
@@ -298,6 +299,7 @@ class Platform:
                 rack,
                 self.grid,
                 self.station,
+                token=token,
                 frequency_hz=frequency_hz,
                 power_kw=power_kw,
                 dt=dt,
@@ -307,18 +309,14 @@ class Platform:
             return {**report, **summary}
 
     def transfer_off_grid(self) -> dict:
-        """离网编排：先回到离网态，再清零功率。"""
+        """离网编排：仲裁 → 分断并网开关 → 零功率。"""
 
         with self._lock:
             op_id = self.ids.next()
-            steps: list[dict] = []
-            violations: list[str] = []
-            if self.pcs.state_machine.state == "tripped":
-                violations.append("pcs_tripped")
-            else:
-                steps.append({"component": "pcs", "action": "transfer", "detail": self.pcs.transfer("off_grid", "off_grid_request")})
-            summary = self._record_operation(op_id, "off_grid", {"ok": not violations, "steps": steps, "violations": violations})
-            return {"station": self.station, "ok": not violations, "steps": steps, "violations": violations, **summary}
+            token = f"off_grid:{op_id}"
+            report = transfer_off_grid(self.pcs, self.station, token=token)
+            summary = self._record_operation(op_id, "off_grid", report)
+            return {**report, **summary}
 
     def discharge(self, power_kw: float = 200.0, dt: float = 60.0) -> dict:
         """放电编排：并网限额钳位 → 爬坡 → 电量累计 → 配额记账。"""
@@ -511,11 +509,12 @@ class Platform:
             return {**report, **summary}
 
     def release_fire(self) -> dict:
-        """复位消防联动与 PCS 跳闸。"""
+        """复位消防联动与 PCS 跳闸（复位共用切换仲裁，落定在停机态）。"""
 
         with self._lock:
+            op_id = self.ids.next()
             released = self.fire.reset()
-            reset = self.pcs.reset_trip()
+            reset = self.pcs.reset_trip(token=f"trip_reset:{op_id}")
             self.bus.publish(Event.of("fire", "fire", "released", station=self.station, severity="notice"))
             return {"fire": released, "pcs": reset}
 
@@ -588,20 +587,40 @@ class Platform:
             }
 
     def concurrency_probe(self, rounds: int = 32) -> dict:
-        """并发探测：多个线程同时切 PCS，核对状态迁移是否原子落定。"""
+        """并发探测：两个线程同时发并网/离网指令，核对切换是否原子落定。
+
+        每轮都走切换仲裁令牌（与真实并网/离网指令同一路径）：两条指令抢同一枚
+        令牌，只有一条生效。每轮采样都核对两个不变量——状态必须是合法模式之一，
+        且状态与接触器必须自洽（并网态开关必闭合、非并网态开关必分断），出现撕裂
+        即记为 ``state_switch_inconsistent``，这正是"既并网又离网"中间态的探针。
+        """
 
         observed: list[str] = []
         lock = threading.Lock()
         errors: list[str] = []
+        inconsistent: list[dict] = []
 
         def worker(target: str) -> None:
-            for _ in range(rounds):
+            for index in range(rounds):
+                token = f"probe-{target}-{index}"
                 try:
-                    self.pcs.transfer(target, "concurrency_probe")
+                    self.pcs.acquire_transfer(token)
+                except StoreError as error:
+                    with lock:
+                        errors.append(f"{target}:{type(error).__name__}")
+                    continue
+                try:
+                    self.pcs.transfer(target, "concurrency_probe", token=token)
                 except StoreError as error:
                     errors.append(f"{target}:{type(error).__name__}")
+                finally:
+                    self.pcs.release_transfer(token)
+                state = self.pcs.state_machine.state
+                closed = self.pcs.switch.is_closed()
                 with lock:
-                    observed.append(self.pcs.state_machine.state)
+                    observed.append(state)
+                    if not ((state == "grid_tie" and closed) or (state != "grid_tie" and not closed)):
+                        inconsistent.append({"state": state, "switch_closed": closed, "target": target})
 
         if self.pcs.state_machine.state == "stopped":
             self.pcs.transfer("off_grid", "probe_setup")
@@ -619,8 +638,11 @@ class Platform:
             "samples": len(observed),
             "states": sorted({state for state in observed}),
             "illegal_states": illegal,
+            "inconsistent_samples": inconsistent,
+            "preempted": self.pcs.arbiter.preempted_count(),
+            "granted": self.pcs.arbiter.granted_count(),
             "rejections": len(errors),
-            "ok": not illegal,
+            "ok": not illegal and not inconsistent,
         }
 
     def concurrency_fault_probe(self, rounds: int = 16) -> dict:
@@ -716,7 +738,16 @@ class Platform:
         return self.bms.snapshot().as_dict()
 
     def pcs_snapshot(self) -> dict:
-        return {**self.pcs.snapshot().as_dict(), "mode_matrix": self.pcs.state_machine.table.matrix()}
+        return {
+            **self.pcs.snapshot().as_dict(),
+            "mode_matrix": self.pcs.state_machine.table.matrix(),
+            "arbiter": {
+                "held": self.pcs.arbiter.is_held(),
+                "holder": self.pcs.arbiter.holder(),
+                "granted": self.pcs.arbiter.granted_count(),
+                "preempted": self.pcs.arbiter.preempted_count(),
+            },
+        }
 
     def temp_snapshot(self) -> dict:
         rack = self._rack(DEFAULT_RACK)

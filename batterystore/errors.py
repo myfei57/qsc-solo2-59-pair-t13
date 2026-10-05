@@ -30,6 +30,23 @@ class StoreError(Exception):
 class InterlockError(StoreError):
     """顺序或联锁条件不满足，动作被拒绝。"""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        component: str = "batterystore",
+        details: dict | None = None,
+    ) -> None:
+        super().__init__(message, component=component)
+        self.details = dict(details or {})
+
+    def as_record(self) -> dict:
+        """转成审计可以直接落盘的一条记录（含仲裁/条件细节）。"""
+
+        record = super().as_record()
+        record.update(self.details)
+        return record
+
 
 class FireError(StoreError):
     """消防联动顺序失败或灭火介质未到位。"""

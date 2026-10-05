@@ -9,10 +9,23 @@ def test_grid_tie_chain_runs_in_order(platform):
     bring_online(platform)
     report = connect_grid(platform)
     actions = [step["action"] for step in report["steps"]]
-    assert actions.index("ready_confirmed") < actions.index("transfer")
-    assert actions.index("transfer") < actions.index("tie_check")
-    assert actions.index("tie_check") < actions.index("clamp")
+    # 仲裁 → 就绪 → 离网建压 → 同期校验 → 合闸落定 → 钳位，顺序由编排写死。
+    assert actions.index("transfer_arbitration") < actions.index("ready_confirmed")
+    assert actions.index("ready_confirmed") < actions.index("build_off_grid_voltage")
+    assert actions.index("build_off_grid_voltage") < actions.index("sync_check")
+    assert actions.index("sync_check") < actions.index("tie_closed")
+    assert actions.index("tie_closed") < actions.index("clamp")
     assert platform.pcs.is_tied()
+    # 顺序选型与其理由必须写进切换记录。
+    assert report["sequence"] == "build_off_grid_voltage_then_close_tie"
+    commit = next(step for step in report["steps"] if step["action"] == "tie_closed")
+    assert commit["detail"]["sequence"]["rejected_alternative"] == "tie_first_then_regulate"
+    assert "冲击电流" in commit["detail"]["sequence"]["rationale"]
+    # 同期校验先于合闸：接触器第一次闭合只能由 tie_closed 这一步产生。
+    sync = report["steps"][actions.index("sync_check")]
+    assert sync["detail"]["frequency_hz"] == 50.0
+    assert commit["detail"]["switch"]["cycles"] == 1
+    assert commit["detail"]["switch"]["closed"] is True
 
 
 def test_grid_tie_refused_when_bms_not_ready(platform):
@@ -21,15 +34,25 @@ def test_grid_tie_refused_when_bms_not_ready(platform):
     report = platform.transfer_grid_tie()
     assert not report["ok"]
     assert report["violations"] == ["bms_not_ready"]
+    # 条件不满足与被抢先要分清：这是就绪条件不成立，不是被另一条指令抢占。
+    assert report["rejection"]["why"] == "condition_not_met"
     assert platform.pcs.state_machine.state == "stopped"
+    assert platform.pcs.arbiter.is_held() is False
 
 
-def test_grid_tie_returns_off_grid_when_frequency_out_of_band(platform):
+def test_grid_tie_returns_stopped_when_frequency_out_of_band(platform):
     bring_online(platform)
     report = platform.transfer_grid_tie(frequency_hz=52.0)
     assert not report["ok"]
     assert "frequency_out_of_band" in report["violations"]
-    assert platform.pcs.state_machine.state == "off_grid"
+    assert report["rejection"]["why"] == "condition_not_met"
+    actions = [step["action"] for step in report["steps"]]
+    # 同期不过：并网开关从未闭合，且回滚到确定的停机态，不停在两态之间。
+    assert "tie_closed" not in actions
+    assert "rollback_stopped" in actions
+    assert platform.pcs.state_machine.state == "stopped"
+    assert platform.pcs.switch.is_closed() is False
+    assert platform.pcs.arbiter.is_held() is False
 
 
 def test_charge_and_discharge_chain(platform):

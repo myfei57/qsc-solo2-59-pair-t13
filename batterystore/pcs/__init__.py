@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .arbiter import TransferArbiter
 from .current import CurrentLadder
 from .curve import EfficiencyCurve
 from .cut import CutOff
@@ -28,6 +29,7 @@ __all__ = [
     "PcsState",
     "PowerController",
     "RampLimiter",
+    "TransferArbiter",
     "TransferSwitch",
     "combine_ratios",
 ]

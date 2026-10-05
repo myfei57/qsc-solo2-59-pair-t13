@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from ..errors import InterlockError
 from ..config import PcsLimits
+from .arbiter import TransferArbiter
 from .current import CurrentLadder
 from .curve import EfficiencyCurve
 from .cut import CutOff
@@ -29,6 +30,7 @@ class Pcs:
         self._limits = limits
         self._state = PcsState(ModeTable())
         self._switch = TransferSwitch()
+        self._arbiter = TransferArbiter()
         self._ramp = RampLimiter(limits.ramp_kw_per_s)
         self._curve = EfficiencyCurve.from_limits(limits)
         self._power = PowerController(limits.max_power_kw, self._curve)
@@ -62,34 +64,65 @@ class Pcs:
     def protection(self) -> PcsProtection:
         return self._protection
 
+    @property
+    def arbiter(self) -> TransferArbiter:
+        return self._arbiter
+
+    def acquire_transfer(self, token: str) -> dict:
+        """申请切换令牌：并发指令只有一条拿得到，拿不到的拿到明确拒绝。"""
+
+        return self._arbiter.acquire(token, self._state.generation)
+
+    def release_transfer(self, token: str) -> dict:
+        """归还切换令牌。"""
+
+        return self._arbiter.release(token)
+
     def is_tied(self) -> bool:
         """是否处于并网态。"""
 
         return self._state.is_tied()
 
-    def transfer(self, target: str, reason: str) -> dict:
-        """执行一次并离网切换，返回切换记录。"""
+    def transfer(self, target: str, reason: str, *, token: str | None = None) -> dict:
+        """执行一次并离网切换，返回切换记录。
+
+        状态迁移与接触器动作在状态机的同一把锁内一次走完，中间不释放，因此外部
+        观察不到"状态已切、接触器没动"的撕裂中间态。``token`` 非空时必须与当前
+        切换令牌持有者一致——并发进来的另一条指令即使绕过编排直接调本体，也会
+        以 ``transfer_preempted`` 被挡下。
+        """
 
         if self._cut.is_tripped():
             raise InterlockError("PCS 处于跳闸态，需先复位", component="pcs")
-        source = self._state.state
-        self._state.transition(target, reason)
-        if target == "grid_tie" and not self._switch.is_closed():
-            self._switch.close()
-        elif target in ("off_grid", "stopped") and self._switch.is_closed():
-            self._switch.open()
-        if target != "grid_tie":
-            self._power.command(0.0)
-            self._ramp.reset()
-        self._transfers += 1
-        return {
-            "from": source,
-            "to": target,
-            "reason": reason,
-            "generation": self._state.generation,
-            "switch": self._switch.as_dict(),
-            "transfers": self._transfers,
-        }
+        if token is not None and self._arbiter.holder() not in (None, token):
+            raise InterlockError(
+                f"切换被抢先：{token} 被 {self._arbiter.holder()} 拒绝",
+                component="pcs",
+                details={
+                    "reason": "transfer_preempted",
+                    "token": token,
+                    "preempted_by": self._arbiter.holder(),
+                },
+            )
+        with self._state.locked():
+            source = self._state.state
+            self._state.transition(target, reason)
+            if target == "grid_tie" and not self._switch.is_closed():
+                self._switch.close()
+            elif target in ("off_grid", "stopped") and self._switch.is_closed():
+                self._switch.open()
+            if target != "grid_tie":
+                self._power.command(0.0)
+                self._ramp.reset()
+            self._transfers += 1
+            return {
+                "from": source,
+                "to": target,
+                "reason": reason,
+                "generation": self._state.generation,
+                "switch": self._switch.as_dict(),
+                "transfers": self._transfers,
+            }
 
     def set_point(self, power_kw: float, dt: float, derate: DerateFactor | None = None) -> dict:
         """按限额与降额下发功率指令并爬坡一步。"""
@@ -116,23 +149,48 @@ class Pcs:
         return self._derate
 
     def trip(self, reason: str) -> dict:
-        """执行跳闸：先切到跳闸态再分断接触器。"""
+        """执行跳闸：先切到跳闸态再分断接触器，全程同一把锁。"""
 
         self._protection.note_trip()
         self._cut.trip(reason)
-        self._state.force("tripped", reason)
-        if self._switch.is_closed():
-            self._switch.open()
-        self._power.command(0.0)
-        self._ramp.reset()
-        return {"state": self._state.state, "reasons": self._cut.reasons(), "trips": self._protection.trips()}
+        revoked = self._arbiter.revoke(reason)
+        with self._state.locked():
+            self._state.force("tripped", reason)
+            if self._switch.is_closed():
+                self._switch.open()
+            self._power.command(0.0)
+            self._ramp.reset()
+            state = self._state.state
+        return {
+            "state": state,
+            "reasons": self._cut.reasons(),
+            "trips": self._protection.trips(),
+            "arbiter": revoked,
+        }
 
-    def reset_trip(self) -> dict:
-        """复位跳闸并回到停机态。"""
+    def reset_trip(self, token: str | None = None) -> dict:
+        """复位跳闸并回到确定的停机态。
 
-        was_tripped = self._cut.clear()
-        self._state.force("stopped", "trip_reset")
-        return {"was_tripped": was_tripped, "state": self._state.state, "resets": self._cut.resets()}
+        复位与并网/离网共用同一枚切换令牌：切换进行中的复位请求会被明确拒绝
+        （``transfer_preempted``），反之亦然。复位落定在停机态，绝不留在跳闸态与
+        停机态之间。
+        """
+
+        if token is not None:
+            self._arbiter.acquire(token, self._state.generation)
+        try:
+            with self._state.locked():
+                was_tripped = self._cut.clear()
+                self._state.force("stopped", "trip_reset")
+                if self._switch.is_closed():
+                    self._switch.open()
+                self._power.command(0.0)
+                self._ramp.reset()
+                state = self._state.state
+        finally:
+            if token is not None:
+                self._arbiter.release(token)
+        return {"was_tripped": was_tripped, "state": state, "resets": self._cut.resets()}
 
     def snapshot(self) -> PcsSnapshot:
         """返回 PCS 状态快照。"""

@@ -38,6 +38,11 @@ class PcsState:
         with self._lock:
             return self._generation
 
+    def locked(self):
+        """返回状态机锁本身，供需要"状态+接触器"原子落定的复合动作整段持有。"""
+
+        return self._lock
+
     def transition(self, target: str, reason: str) -> str:
         """在锁内完成一次迁移。"""
 
